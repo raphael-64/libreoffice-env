@@ -34,6 +34,13 @@ def start_episode(task_id: str) -> Dict[str, Any]:
     
     sandbox, run_dir, task_def = runner.start_episode(task_id)
     
+    # Auto-start GUI for computer-use tasks
+    if task_def.get("mode") == "computer_use":
+        initial_files = task_def.get("initial_files", [])
+        filename = initial_files[0] if initial_files else None
+        logger.info(f"Auto-starting GUI for computer-use task with {filename}")
+        sandbox.start_gui(filename)
+    
     context = EpisodeContext(
         task_id=task_id,
         run_dir=run_dir,

@@ -509,19 +509,43 @@ def take_screenshot() -> str:
     """Capture screenshot, returns base64 PNG."""
     ctx = get_context()
     
-    python_code = """
-import subprocess
+    import time
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    # Generate unique screenshot name based on counter
+    import os
+    screenshot_dir = ctx.run_dir / "screenshots"
+    screenshot_dir.mkdir(exist_ok=True)
+    
+    # Count existing screenshots to get next number
+    existing = len([f for f in screenshot_dir.glob("*.png")])
+    screenshot_name = f"screenshot_{existing:03d}.png"
+    container_path = f"/workspace/screenshots/{screenshot_name}"
+    
+    # CRITICAL: Use DISPLAY=:99 inline for EVERY command
+    # Docker exec_run doesn't preserve exported env vars between commands
+    shell_script = f"""
+mkdir -p /workspace/screenshots
+
+# Dummy operation to trigger LibreOffice redraw in same session
+DISPLAY=:99 xdotool search --name 'LibreOffice' windowactivate --sync 2>/dev/null || true
+sleep 0.5
+
+# Now take screenshot in SAME shell session - MUST use DISPLAY=:99 inline
+# Use import (ImageMagick) instead of scrot as it is more reliable with Xvfb
+DISPLAY=:99 import -window root /tmp/screenshot.png
+cp /tmp/screenshot.png {container_path}
+
+# Return as base64
+python3 -c "
 import base64
-
-subprocess.run(['scrot', '/tmp/screenshot.png'], env={'DISPLAY': ':99'})
-
 with open('/tmp/screenshot.png', 'rb') as f:
-    img_data = f.read()
-    b64 = base64.b64encode(img_data).decode('utf-8')
-    print(b64)
+    print(base64.b64encode(f.read()).decode('utf-8'))
+"
 """
     
-    result = ctx.sandbox_manager.execute_command(["python", "-c", python_code])
+    result = ctx.sandbox_manager.execute_command(["sh", "-c", shell_script])
     
     if result['exit_code'] != 0:
         error_msg = result['error'] or result['output']
@@ -543,6 +567,16 @@ def click(x: int, y: int) -> str:
     if result['exit_code'] != 0:
         raise RuntimeError(f"Click failed: {result['error']}")
     
+    # Add delay for GUI to process
+    import time
+    time.sleep(0.3)
+    
+    # Force window refresh to update display buffer
+    ctx.sandbox_manager.execute_command([
+        "sh", "-c",
+        "DISPLAY=:99 xdotool search --name 'LibreOffice' windowactivate --sync"
+    ])
+    
     return f"Clicked at ({x}, {y})"
 
 
@@ -558,6 +592,16 @@ def double_click(x: int, y: int) -> str:
     
     if result['exit_code'] != 0:
         raise RuntimeError(f"Double-click failed: {result['error']}")
+    
+    # Add delay for GUI to process
+    import time
+    time.sleep(0.3)
+    
+    # Force window refresh to update display buffer
+    ctx.sandbox_manager.execute_command([
+        "sh", "-c",
+        "DISPLAY=:99 xdotool search --name 'LibreOffice' windowactivate --sync"
+    ])
     
     return f"Double-clicked at ({x}, {y})"
 
@@ -586,6 +630,16 @@ def type_text(text: str) -> str:
     if result['exit_code'] != 0:
         raise RuntimeError(f"Type failed: {result['error']}")
     
+    # Add delay for GUI to process
+    import time
+    time.sleep(0.3)
+    
+    # Force window refresh to update display buffer
+    ctx.sandbox_manager.execute_command([
+        "sh", "-c",
+        "DISPLAY=:99 xdotool search --name 'LibreOffice' windowactivate --sync"
+    ])
+    
     return f"Typed: {text}"
 
 
@@ -610,7 +664,147 @@ def press_key(key: str) -> str:
     if result['exit_code'] != 0:
         raise RuntimeError(f"Key press failed: {result['error']}")
     
+    # Add delay for GUI to process
+    import time
+    time.sleep(0.3)
+    
+    # Force window refresh to update display buffer
+    ctx.sandbox_manager.execute_command([
+        "sh", "-c",
+        "DISPLAY=:99 xdotool search --name 'LibreOffice' windowactivate --sync"
+    ])
+    
     return f"Pressed: {key}"
+
+
+@mcp.tool()
+def goto_cell(cell: str) -> str:
+    """
+    Navigate to a specific cell using keyboard (more reliable than clicking).
+    IMPORTANT: Only navigate to ONE cell per tool call. Take a screenshot after to verify.
+    
+    Args:
+        cell: Cell reference like "C2", "A1", etc.
+    
+    Returns:
+        Success message with current cell location
+    """
+    ctx = get_context()
+    import time
+    
+    # Parse cell reference (e.g., "C2" -> column C, row 2)
+    import re
+    match = re.match(r'^([A-Z]+)(\d+)$', cell.upper())
+    if not match:
+        raise ValueError(f"Invalid cell reference: {cell}")
+    
+    col_letters, row_num = match.groups()
+    
+    # First, go to A1 with Ctrl+Home (guaranteed starting point)
+    result = ctx.sandbox_manager.execute_command([
+        "sh", "-c",
+        "DISPLAY=:99 xdotool key ctrl+Home"
+    ])
+    
+    if result['exit_code'] != 0:
+        raise RuntimeError(f"Failed to go to A1: {result['error']}")
+    
+    time.sleep(0.3)
+    
+    # Navigate to target column (A=0, B=1, C=2, etc.)
+    col_index = 0
+    for char in col_letters:
+        col_index = col_index * 26 + (ord(char) - ord('A'))
+    
+    if col_index > 0:
+        # Press Right arrow col_index times
+        for _ in range(col_index):
+            result = ctx.sandbox_manager.execute_command([
+                "sh", "-c",
+                "DISPLAY=:99 xdotool key Right"
+            ])
+            time.sleep(0.1)
+    
+    # Navigate to target row (rows are 1-indexed)
+    target_row = int(row_num)
+    if target_row > 1:
+        # Press Down arrow (target_row - 1) times
+        for _ in range(target_row - 1):
+            result = ctx.sandbox_manager.execute_command([
+                "sh", "-c",
+                "DISPLAY=:99 xdotool key Down"
+            ])
+            time.sleep(0.1)
+    
+    time.sleep(0.3)
+    
+    return f"Navigated to cell {cell.upper()}"
+
+
+@mcp.tool()
+def navigate_arrow(direction: str, count: int = 1) -> str:
+    """
+    Move cursor using arrow keys.
+    
+    Args:
+        direction: One of "up", "down", "left", "right"
+        count: Number of times to press the arrow key (default: 1)
+    
+    Returns:
+        Success message
+    """
+    ctx = get_context()
+    
+    direction_map = {
+        "up": "Up",
+        "down": "Down", 
+        "left": "Left",
+        "right": "Right"
+    }
+    
+    if direction.lower() not in direction_map:
+        raise ValueError(f"Invalid direction: {direction}. Use: up, down, left, right")
+    
+    key = direction_map[direction.lower()]
+    
+    # Press arrow key multiple times if needed
+    for _ in range(count):
+        result = ctx.sandbox_manager.execute_command([
+            "sh", "-c",
+            f"DISPLAY=:99 xdotool key {key}"
+        ])
+        
+        if result['exit_code'] != 0:
+            raise RuntimeError(f"Failed to press {key}: {result['error']}")
+        
+        import time
+        time.sleep(0.2)
+    
+    return f"Moved {direction} {count} time(s)"
+
+
+@mcp.tool()
+def enter_edit_mode() -> str:
+    """
+    Enter edit mode in the current cell (equivalent to double-clicking or pressing F2).
+    
+    Returns:
+        Success message
+    """
+    ctx = get_context()
+    
+    result = ctx.sandbox_manager.execute_command([
+        "sh", "-c",
+        "DISPLAY=:99 xdotool key F2"
+    ])
+    
+    if result['exit_code'] != 0:
+        raise RuntimeError(f"Failed to enter edit mode: {result['error']}")
+    
+    import time
+    time.sleep(0.3)
+    
+    return "Entered edit mode"
 
 
 @mcp.tool()
@@ -659,6 +853,9 @@ def get_computer_use_tools() -> dict:
         "double_click": double_click,
         "type_text": type_text,
         "press_key": press_key,
+        "goto_cell": goto_cell,
+        "navigate_arrow": navigate_arrow,
+        "enter_edit_mode": enter_edit_mode,
         "list_workspace_files": list_workspace_files,
         "get_task_description": get_task_description,
         "submit_task": submit_task

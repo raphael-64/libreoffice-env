@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     x11-utils \
     imagemagick \
     openbox \
+    wmctrl \
     && rm -rf /var/lib/apt/lists/*
 
 # Set up display for GUI mode

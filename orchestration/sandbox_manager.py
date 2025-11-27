@@ -249,13 +249,13 @@ class SandboxManager:
             raise RuntimeError(f"Could not reconnect to container {container_id}") from e
     
     def start_gui(self, filename: str | None = None) -> None:
-        """Start Xvfb virtual display and open file in LibreOffice GUI."""
+        """Start VNC server virtual display and open file in LibreOffice GUI."""
         if self.container is None:
             raise RuntimeError("No container running")
         
         logger.info("Starting GUI mode (Xvfb + LibreOffice)")
         
-        # Start Xvfb (virtual display) with XTEST extension for xdotool
+        # Back to Xvfb - my manual test with test_edit.png WORKED with Xvfb!
         result = self.execute_command([
             "sh", "-c", 
             "Xvfb :99 -screen 0 1024x768x24 +extension XTEST -ac > /tmp/xvfb.log 2>&1 &"
@@ -279,17 +279,21 @@ class SandboxManager:
         
         # Open file in LibreOffice if specified
         if filename:
+            # Disable first-run tips/dialogs
             result = self.execute_command([
                 "sh", "-c",
-                f"DISPLAY=:99 libreoffice --calc /workspace/{filename} > /tmp/libreoffice.log 2>&1 &"
+                f"DISPLAY=:99 libreoffice --calc --nofirststartwizard --nologo /workspace/{filename} > /tmp/libreoffice.log 2>&1 &"
             ])
             
             if result['exit_code'] != 0:
                 logger.warning(f"LibreOffice might not have started: {result['error']}")
             
             # Wait for LibreOffice to open
-            time.sleep(3)
+            time.sleep(4)
             logger.info(f"LibreOffice opened with {filename}")
+            
+            # LibreOffice Calc starts with cursor at A1 by default
+            logger.info("Spreadsheet ready, cursor at A1")
         else:
             logger.info("Xvfb ready (no file opened)")
     

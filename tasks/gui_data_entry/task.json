@@ -3,7 +3,7 @@
   "title": "Fill Status Column via GUI",
   "mode": "computer_use",
   "description": "Using the GUI, double-click on each cell in the Status column (C2, C3, C4) to enter edit mode, type 'OK', then press Enter. Do this for all 3 product rows. Finally save with Ctrl+S.",
-  "time_limit_seconds": 300,
+  "time_limit_seconds": 600,
   "initial_files": ["inventory.ods"],
   "expected_outputs": ["inventory.ods"]
 }
