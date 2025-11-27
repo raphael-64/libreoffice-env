@@ -1,77 +1,115 @@
 # LibreOffice RL Environment
 
-MCP-based sandboxed environment for training AI agents on spreadsheet tasks.
-Tool-use is implemented and reliable, computer-use has been started but not fully working.
+MCP-based sandboxed environment for AI agents to practice spreadsheet tasks.
+
+## Architecture
+
+```
+Agent → MCP Protocol → MCP Server → Docker Container (LibreOffice)
+```
+
+- **Orchestration**: Python API manages container lifecycle
+- **Execution**: MCP protocol for tool calls (stdio + JSON-RPC)
+- **Isolation**: Docker containers, network disabled, fresh per task
 
 ## Setup
-
-### Prerequisites
-
-- Docker Desktop (running)
-- Python 3.12+
-- uv package manager
-- optional OpenAI API key (in `.env` file) if you want to test the env
-
-### Install
 
 ```bash
 uv sync
 docker build -t libreoffice-sandbox:latest sandbox/
 ```
 
-## Architecture
+**Prerequisites:** Docker Desktop, Python 3.12+, uv, OpenAI API key (optional)
 
-```
-tasks/               # Task definitions
-  {task_id}/
-    task.json        # Problem statement
-    initial/         # Starting files
-    oracle/          # Expected outputs
+## Usage
 
-runs/                # Episode runs (auto-generated)
-  {task_id}/
-    run_001/         # Episode 1
-    run_002/         # Episode 2
-```
-
-**One base Docker image** → Used for ALL episodes
-**Fresh files** → Copied from `tasks/initial/` each episode
-**Isolated execution** → Each episode in separate run directory
-
-## Quick Start
-
-```python
-from libreoffice_env import LibreOfficeEnv
-from mcp_server import get_tool_use_tools
-
-env = LibreOfficeEnv()
-state = env.reset("sales_totals")
-
-# Your agent acts using MCP tools
-tools = get_tool_use_tools()
-# tools = {read_cell, write_cell, write_formula, execute_sql, ...}
-
-# After agent acts, get reward
-score = env.get_reward()
-env.close(cleanup=True)
-```
-
-### Run Example with OpenAI
+### Basic testing with openai
 
 ```bash
-python examples/run_with_openai.py --task-id sales_totals
+python examples/run_with_openai_mcp.py --task-id sales_totals
 ```
 
-This will:
+## File Structure
 
-1. Create run directory with fresh files
-2. Start container
-3. Send task to GPT-4
-4. Agent uses MCP tools to solve
-5. Automatic grading vs oracle
-6. Return score + feedback
+```
+mcp_server.py           # 17 MCP tools
+utils.py                # CellRef + Context
+spreadsheet_ops.py      # Operation scripts
+grader.py               # Automated grading
 
-### Create New Task
+orchestration/          # Internal
+  ├── episode_runner.py # Episode lifecycle
+  ├── sandbox_manager.py # Docker management
+  └── task_manager.py    # Task loading
+
+examples/               # Usage examples
+  ├── mcp_client.py      # MCP client (SDK)
+  ├── run_with_openai_mcp.py
+  └── simple_mcp_usage.py
+
+sandbox/                # Docker build
+tasks/                  # Task definitions
+runs/                   # Episode outputs
+```
+
+## MCP Tools (17 total)
+
+**Spreadsheet:**
+
+- `read_cell`, `read_range`, `write_cell`, `write_formula`
+- `get_spreadsheet_info`, `create_new_spreadsheet`
+
+**Database:**
+
+- `execute_sql`, `list_database_tables`
+
+**Files:**
+
+- `list_workspace_files`
+
+**Task:**
+
+- `get_task_description`, `submit_task`
+
+**GUI (experimental):**
+
+- `take_screenshot`, `click`, `double_click`, `type_text`, `press_key`
+
+## Available Tasks
+
+- `sales_totals` - Calculate totals with formulas
+- `banking_reserves` - Reserve calculations
+- `department_summary` - Employee summary
+- `sales_report` - Database to spreadsheet
+- `gui_data_entry` - Computer-use mode (experimental)
+
+## Example: MCP Protocol
+
+```python
+import asyncio
+from orchestration.episode_runner import EpisodeRunner
+from examples.mcp_client import MCPClient
+
+async def solve():
+    runner = EpisodeRunner()
+    sandbox, run_dir, _ = runner.start_episode("sales_totals")
+
+    async with MCPClient() as mcp:
+        await mcp.connect_to_server("mcp_server.py", env={
+            'MCP_CONTAINER_ID': sandbox.container_id,
+            'MCP_EPISODE_RUN_DIR': str(run_dir),
+            'MCP_EPISODE_TASK_ID': "sales_totals"
+        })
+
+        result = await mcp.call_tool("read_cell", {...})
+        await mcp.call_tool("submit_task", {})
+
+    runner.end_episode()
+
+asyncio.run(solve())
+```
+
+## Creating Tasks
 
 ```python
 from orchestration.task_manager import TaskManager
@@ -80,64 +118,9 @@ tm = TaskManager()
 tm.create_task(
     task_id="my_task",
     title="Task Title",
-    description="Clear instructions for agent...",
+    description="Instructions...",
     initial_files={"data.ods": Path("input.ods")},
     oracle_files={"data.ods": Path("expected.ods")},
     time_limit=600
 )
-```
-
-### Use with Your Own Agent
-
-```python
-from orchestration.env_runner import EpisodeRunner
-
-runner = EpisodeRunner()
-
-for i in range(10):
-    # Start episode - gets fresh files
-    sandbox, run_dir, task = runner.start_episode("sales_totals")
-
-    # Your agent solves the task using MCP tools
-    # (Connect to mcp_server.py or use tools directly)
-
-    # Grade when done
-    result = runner.end_episode(grade=True, cleanup=True)
-    print(f"Episode {i}: Score {result['score']}")
-```
-
-See `examples/run_with_openai.py` for a complete OpenAI agent implementation.
-
-## MCP Tools (15 total)
-
-**Tool Use Mode (Production):**
-
-- `read_cell`, `write_cell`, `write_formula` - Spreadsheet operations
-- `execute_sql`, `list_database_tables` - SQLite queries
-- `create_new_spreadsheet` - File creation
-- `get_spreadsheet_info`, `list_workspace_files` - Discovery
-- `get_task_description`, `submit_task` - Task workflow
-
-**Computer Use Mode (Experimental):**
-
-- `take_screenshot`, `click`, `double_click` - GUI interaction
-- `type_text`, `press_key` - Keyboard control
-- **Note:** Infrastructure in place but LibreOffice GUI interaction needs debugging
-
-## Project Structure
-
-```
-libreoffice-env/
-├── mcp_server.py                # MCP server with 15 tools
-├── orchestration/               # Core environment
-│   ├── sandbox_manager.py       # Docker lifecycle
-│   ├── task_manager.py          # Task loading
-│   └── env_runner.py            # Episode management
-├── evaluation/
-│   └── grader.py                # Automated grading
-├── examples/                    # Example usage
-│   ├── openai_agent.py          # OpenAI-based agent
-│   └── run_with_openai.py       # Run episodes with OpenAI
-├── tasks/                       # Task definitions
-└── sandbox/                     # Docker image
 ```

@@ -224,6 +224,30 @@ class SandboxManager:
         except DockerException:
             return False
     
+    def reconnect_to_container(self, container_id: str) -> None:
+        """
+        Reconnect to an existing container.
+        
+        This is used when MCP server runs as subprocess and needs to
+        connect to the container started by the parent process.
+        
+        Args:
+            container_id: Docker container ID to reconnect to
+        """
+        try:
+            self.container = self.client.containers.get(container_id)
+            self.container_id = container_id
+            
+            # Verify it's running
+            if self.container.status != "running":
+                logger.warning(f"Container {container_id[:12]} is not running (status: {self.container.status})")
+            else:
+                logger.info(f"Reconnected to container: {container_id[:12]}")
+        
+        except DockerException as e:
+            logger.error(f"Failed to reconnect to container {container_id}: {e}")
+            raise RuntimeError(f"Could not reconnect to container {container_id}") from e
+    
     def start_gui(self, filename: str | None = None) -> None:
         """Start Xvfb virtual display and open file in LibreOffice GUI."""
         if self.container is None:

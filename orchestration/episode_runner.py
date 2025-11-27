@@ -7,7 +7,7 @@ from datetime import datetime
 
 from orchestration.task_manager import TaskManager
 from orchestration.sandbox_manager import SandboxManager
-from evaluation.grader import grade_task_run
+from grader import grade_task_run
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +39,12 @@ class EpisodeRunner:
         self.current_sandbox: SandboxManager | None = None
         self.current_run_dir: Path | None = None
     
-    def setup_episode(self, task_id: str, episode_num: int | None = None) -> Path:
+    def setup_episode(self, task_id: str) -> Path:
         """
         Set up a new episode: create run directory and copy initial files.
         
         Args:
             task_id: Task identifier
-            episode_num: Episode number (auto-generated if None)
         
         Returns:
             Path to run directory
@@ -53,13 +52,11 @@ class EpisodeRunner:
         # Load task definition
         task_def = self.task_manager.load_task(task_id)
         
-        # Create run directory
-        if episode_num is None:
-            # Auto-generate episode number
-            task_runs = self.runs_dir / task_id
-            task_runs.mkdir(exist_ok=True)
-            existing = [d for d in task_runs.iterdir() if d.is_dir()]
-            episode_num = len(existing) + 1
+        # Auto-generate episode number
+        task_runs = self.runs_dir / task_id
+        task_runs.mkdir(exist_ok=True)
+        existing = [d for d in task_runs.iterdir() if d.is_dir()]
+        episode_num = len(existing) + 1
         
         run_dir = self.runs_dir / task_id / f"run_{episode_num:03d}"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -79,7 +76,6 @@ class EpisodeRunner:
     def start_episode(
         self,
         task_id: str,
-        episode_num: int | None = None,
         timeout_seconds: int | None = None
     ) -> tuple[SandboxManager, Path, Dict[str, Any]]:
         """
@@ -87,14 +83,13 @@ class EpisodeRunner:
         
         Args:
             task_id: Task identifier
-            episode_num: Episode number (auto if None)
             timeout_seconds: Timeout (uses task default if None)
         
         Returns:
             (SandboxManager, run_directory, task_definition)
         """
         # Setup episode
-        run_dir = self.setup_episode(task_id, episode_num)
+        run_dir = self.setup_episode(task_id)
         
         # Load task for timeout
         task_def = self.task_manager.load_task(task_id)
@@ -159,8 +154,7 @@ class EpisodeRunner:
     def run_episode(
         self,
         task_id: str,
-        agent_function,
-        episode_num: int | None = None
+        agent_function
     ) -> Dict[str, Any]:
         """
         Run a complete episode with an agent function.
@@ -168,12 +162,11 @@ class EpisodeRunner:
         Args:
             task_id: Task identifier
             agent_function: Function that takes (sandbox, task_def) and performs task
-            episode_num: Episode number
         
         Returns:
             Grading result
         """
-        sandbox, run_dir, task_def = self.start_episode(task_id, episode_num)
+        sandbox, run_dir, task_def = self.start_episode(task_id)
         
         try:
             # Agent acts

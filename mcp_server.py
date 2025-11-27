@@ -2,100 +2,24 @@
 from typing import Any
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
-from orchestration.sandbox_manager import SandboxManager
-from orchestration.task_manager import TaskManager
+
+from utils import get_context, CellRef
 
 # Initialize FastMCP server
 mcp = FastMCP("libreoffice-sandbox")
 
-# Global state (for when MCP server is used with start_episode.py)
-sandbox_manager: SandboxManager | None = None
-task_manager: TaskManager | None = None
-current_task_id: str | None = None
-current_run_dir: Path | None = None
 
+# ============================================================================
+# Script Generation Helpers
+# ============================================================================
 
-def load_episode_context():
-    """Load episode context if it exists."""
-    global current_task_id, current_run_dir, sandbox_manager
-    
-    context_file = Path(__file__).parent / ".episode_context.json"
-    if context_file.exists():
-        import json
-        with open(context_file) as f:
-            context = json.load(f)
-        
-        if context.get("task_id"):
-            current_task_id = context["task_id"]
-        if context.get("run_dir"):
-            current_run_dir = Path(context["run_dir"])
-            
-            # Use the run dir as workspace
-            if sandbox_manager is None:
-                sandbox_manager = SandboxManager(workspace_path=current_run_dir)
-
-
-def ensure_sandbox() -> SandboxManager:
-    """Ensure sandbox is running, start if needed."""
-    global sandbox_manager
-    
-    # Check if episode context exists
-    load_episode_context()
-    
-    if sandbox_manager is None or not sandbox_manager.is_running():
-        if sandbox_manager is None:
-            sandbox_manager = SandboxManager()
-        
-        sandbox_dir = Path(__file__).parent / "sandbox"
-        
-        # Build image if needed
-        try:
-            sandbox_manager.client.images.get(sandbox_manager.image_name)
-        except Exception:
-            sandbox_manager.build_image(sandbox_dir)
-        
-        # Start container (with volume mount for Claude Desktop testing)
-        sandbox_manager.start_container(use_volume_mount=True)
-    
-    return sandbox_manager
-
-
-def execute_python_in_sandbox(code: str) -> dict[str, Any]:
-    """
-    Execute Python code inside the sandbox container.
-    
-    Args:
-        code: Python code to execute
-    
-    Returns:
-        Dict with 'exit_code', 'output', 'error'
-    """
-    manager = ensure_sandbox()
-    return manager.execute_command(["python", "-c", code])
-
-
-@mcp.tool()
-def read_cell(filename: str, sheet: str, cell: str) -> str:
-    """Read value from a cell (e.g., read_cell("data.ods", "Sheet1", "A1"))."""
-    # Convert A1 notation to row/col indices
-    col_letter = ''.join(c for c in cell if c.isalpha()).upper()
-    row_num = int(''.join(c for c in cell if c.isdigit())) - 1  # 0-indexed
-    
-    # Convert column letter to index (A=0, B=1, Z=25, AA=26, etc.)
-    col_num = 0
-    for i, char in enumerate(reversed(col_letter)):
-        col_num += (ord(char) - ord('A') + 1) * (26 ** i)
-    col_num -= 1  # 0-indexed
-    
-    # Python code to read the cell
-    python_code = f"""
+def _read_cell_script(filename: str, sheet: str, row: int, col: int) -> str:
+    """Generate Python script to read a cell."""
+    return f"""
 from odf.opendocument import load
 from odf import table, text
 
-# Load spreadsheet
 doc = load('/workspace/{filename}')
-
-# Find the sheet
 tables = doc.spreadsheet.getElementsByType(table.Table)
 target_table = None
 for tbl in tables:
@@ -107,33 +31,247 @@ if target_table is None:
     print('ERROR: Sheet not found')
     exit(1)
 
-# Get the row
 rows = target_table.getElementsByType(table.TableRow)
-if {row_num} >= len(rows):
+if {row} >= len(rows):
     print('ERROR: Row index out of range')
     exit(1)
 
-# Get the cell
-cells = rows[{row_num}].getElementsByType(table.TableCell)
-if {col_num} >= len(cells):
+cells = rows[{row}].getElementsByType(table.TableCell)
+if {col} >= len(cells):
     print('ERROR: Column index out of range')
     exit(1)
 
-# Extract text from cell
-paragraphs = cells[{col_num}].getElementsByType(text.P)
+paragraphs = cells[{col}].getElementsByType(text.P)
 if paragraphs:
     print(str(paragraphs[0]))
 else:
     print('')
 """
+
+
+def _read_range_script(filename: str, sheet: str, start_row: int, start_col: int, 
+                       end_row: int, end_col: int) -> str:
+    """Generate Python script to read a range of cells."""
+    return f"""
+import json
+from odf.opendocument import load
+from odf import table, text
+
+doc = load('/workspace/{filename}')
+tables = doc.spreadsheet.getElementsByType(table.Table)
+target_table = None
+for tbl in tables:
+    if tbl.getAttribute('name') == '{sheet}':
+        target_table = tbl
+        break
+
+if target_table is None:
+    print('ERROR: Sheet not found')
+    exit(1)
+
+rows = target_table.getElementsByType(table.TableRow)
+if {end_row} >= len(rows):
+    print('ERROR: End row index out of range')
+    exit(1)
+
+result = []
+for row_idx in range({start_row}, {end_row} + 1):
+    if row_idx >= len(rows):
+        break
     
-    result = execute_python_in_sandbox(python_code)
+    row = rows[row_idx]
+    cells = row.getElementsByType(table.TableCell)
+    
+    row_values = []
+    for col_idx in range({start_col}, {end_col} + 1):
+        if col_idx >= len(cells):
+            row_values.append('')
+        else:
+            cell = cells[col_idx]
+            paragraphs = cell.getElementsByType(text.P)
+            if paragraphs:
+                row_values.append(str(paragraphs[0]))
+            else:
+                row_values.append('')
+    
+    result.append(row_values)
+
+print(json.dumps(result))
+"""
+
+
+def _write_cell_script(filename: str, sheet: str, row: int, col: int, value: str) -> str:
+    """Generate Python script to write a cell value."""
+    escaped_value = value.replace("'", "\\'")
+    
+    return f"""
+from odf.opendocument import load
+from odf import table
+from odf.table import TableRow, TableCell
+from odf.text import P
+
+try:
+    doc = load('/workspace/{filename}')
+except FileNotFoundError:
+    from odf.opendocument import OpenDocumentSpreadsheet
+    from odf.table import Table
+    doc = OpenDocumentSpreadsheet()
+    new_table = Table(name='{sheet}')
+    doc.spreadsheet.addElement(new_table)
+
+tables = doc.spreadsheet.getElementsByType(table.Table)
+target_table = None
+for tbl in tables:
+    if tbl.getAttribute('name') == '{sheet}':
+        target_table = tbl
+        break
+
+if target_table is None:
+    print('ERROR: Sheet not found')
+    exit(1)
+
+rows = target_table.getElementsByType(table.TableRow)
+while len(rows) <= {row}:
+    target_table.addElement(TableRow())
+    rows = target_table.getElementsByType(table.TableRow)
+
+target_row = rows[{row}]
+cells = target_row.getElementsByType(table.TableCell)
+while len(cells) <= {col}:
+    target_row.addElement(TableCell())
+    cells = target_row.getElementsByType(table.TableCell)
+
+target_cell = cells[{col}]
+
+for child in list(target_cell.childNodes):
+    target_cell.removeChild(child)
+
+target_cell.addElement(P(text='{escaped_value}'))
+
+doc.save('/workspace/{filename}')
+print('Success')
+"""
+
+
+def _write_formula_script(filename: str, sheet: str, row: int, col: int, formula: str) -> str:
+    """Generate Python script to write a formula."""
+    escaped_formula = formula.replace("'", "\\'")
+    
+    return f"""
+from odf.opendocument import load
+from odf import table
+from odf.table import TableRow, TableCell
+
+doc = load('/workspace/{filename}')
+
+tables = doc.spreadsheet.getElementsByType(table.Table)
+target_table = None
+for tbl in tables:
+    if tbl.getAttribute('name') == '{sheet}':
+        target_table = tbl
+        break
+
+if target_table is None:
+    print('ERROR: Sheet not found')
+    exit(1)
+
+rows = target_table.getElementsByType(table.TableRow)
+while len(rows) <= {row}:
+    target_table.addElement(TableRow())
+    rows = target_table.getElementsByType(table.TableRow)
+
+target_row = rows[{row}]
+cells = target_row.getElementsByType(table.TableCell)
+while len(cells) <= {col}:
+    target_row.addElement(TableCell())
+    cells = target_row.getElementsByType(table.TableCell)
+
+target_cell = cells[{col}]
+target_cell.setAttribute('formula', '{escaped_formula}')
+
+doc.save('/workspace/{filename}')
+print('Success')
+"""
+
+
+@mcp.tool()
+def read_cell(filename: str, sheet: str, cell: str) -> str:
+    """
+    Read value from a single cell (e.g., read_cell("data.ods", "Sheet1", "A1")).
+    
+    For reading multiple cells, use read_range() instead.
+    """
+    ctx = get_context()
+    
+    # Validate it's a single cell, not a range
+    if ':' in cell or '-' in cell:
+        raise ValueError(
+            f"read_cell only accepts single cells like 'A1'. "
+            f"Got: '{cell}'. Use read_range() to read multiple cells."
+        )
+    
+    cell_ref = CellRef.from_a1(cell)
+    script = _read_cell_script(filename, sheet, cell_ref.row, cell_ref.col)
+    result = ctx.sandbox_manager.execute_command(["python", "-c", script])
     
     if result['exit_code'] != 0:
         error_msg = result['error'] or result['output']
         raise RuntimeError(f"Failed to read cell: {error_msg}")
     
     return result['output'].strip()
+
+
+@mcp.tool()
+def read_range(filename: str, sheet: str, start_cell: str, end_cell: str) -> list[list[str]]:
+    """
+    Read a range of cells (e.g., read_range("data.ods", "Sheet1", "A1", "E1")).
+    
+    Returns a 2D array of cell values. For a single row like A1:E1, returns [[val1, val2, ...]].
+    For multiple rows like A1:B3, returns [[a1, b1], [a2, b2], [a3, b3]].
+    """
+    ctx = get_context()
+    
+    start_ref = CellRef.from_a1(start_cell)
+    end_ref = CellRef.from_a1(end_cell)
+    script = _read_range_script(filename, sheet, start_ref.row, start_ref.col, end_ref.row, end_ref.col)
+    result = ctx.sandbox_manager.execute_command(["python", "-c", script])
+    
+    if result['exit_code'] != 0:
+        error_msg = result['error'] or result['output']
+        raise RuntimeError(f"Failed to read range: {error_msg}")
+    
+    import json
+    return json.loads(result['output'].strip())
+
+
+@mcp.tool()
+def write_cell(filename: str, sheet: str, cell: str, value: str) -> str:
+    """Write value to a cell."""
+    ctx = get_context()
+    cell_ref = CellRef.from_a1(cell)
+    script = _write_cell_script(filename, sheet, cell_ref.row, cell_ref.col, value)
+    result = ctx.sandbox_manager.execute_command(["python", "-c", script])
+    
+    if result['exit_code'] != 0:
+        error_msg = result['error'] or result['output']
+        raise RuntimeError(f"Failed to write cell: {error_msg}")
+    
+    return f"Successfully wrote '{value}' to {sheet}!{cell}"
+
+
+@mcp.tool()
+def write_formula(filename: str, sheet: str, cell: str, formula: str) -> str:
+    """Write formula to a cell (e.g., "=SUM(A1:A10)")."""
+    ctx = get_context()
+    cell_ref = CellRef.from_a1(cell)
+    script = _write_formula_script(filename, sheet, cell_ref.row, cell_ref.col, formula)
+    result = ctx.sandbox_manager.execute_command(["python", "-c", script])
+    
+    if result['exit_code'] != 0:
+        error_msg = result['error'] or result['output']
+        raise RuntimeError(f"Failed to write formula: {error_msg}")
+    
+    return f"Successfully wrote formula '{formula}' to {sheet}!{cell}"
 
 
 @mcp.tool()
@@ -146,25 +284,15 @@ def get_spreadsheet_info(filename: str) -> dict[str, Any]:
     
     Returns:
         Dictionary with sheet names and dimensions
-    
-    Example:
-        get_spreadsheet_info("data.ods") -> 
-        {
-            "sheets": [
-                {"name": "Sheet1", "rows": 100, "cols": 10},
-                {"name": "Sheet2", "rows": 50, "cols": 5}
-            ]
-        }
     """
+    ctx = get_context()
+    
     python_code = f"""
 import json
 from odf.opendocument import load
 from odf import table
 
-# Load spreadsheet
 doc = load('/workspace/{filename}')
-
-# Get all sheets
 tables = doc.spreadsheet.getElementsByType(table.Table)
 
 sheets = []
@@ -172,7 +300,6 @@ for tbl in tables:
     name = tbl.getAttribute('name')
     rows = tbl.getElementsByType(table.TableRow)
     
-    # Count max columns
     max_cols = 0
     for row in rows:
         cells = row.getElementsByType(table.TableCell)
@@ -187,7 +314,7 @@ for tbl in tables:
 print(json.dumps({{'sheets': sheets}}))
 """
     
-    result = execute_python_in_sandbox(python_code)
+    result = ctx.sandbox_manager.execute_command(["python", "-c", python_code])
     
     if result['exit_code'] != 0:
         error_msg = result['error'] or result['output']
@@ -204,170 +331,15 @@ def list_workspace_files() -> list[str]:
     
     Returns:
         List of filenames in /workspace
-    
-    Example:
-        list_workspace_files() -> ["sales.ods", "template.ods"]
     """
-    manager = ensure_sandbox()
-    result = manager.execute_command(["ls", "-1", "/workspace"])
+    ctx = get_context()
+    result = ctx.sandbox_manager.execute_command(["ls", "-1", "/workspace"])
     
     if result['exit_code'] != 0:
         raise RuntimeError(f"Failed to list files: {result['error']}")
     
     files = [f.strip() for f in result['output'].split('\n') if f.strip()]
     return files
-
-
-# Cleanup handler
-@mcp.tool()
-def write_cell(filename: str, sheet: str, cell: str, value: str) -> str:
-    """Write value to a cell."""
-    # Convert A1 notation to row/col indices
-    col_letter = ''.join(c for c in cell if c.isalpha()).upper()
-    row_num = int(''.join(c for c in cell if c.isdigit())) - 1  # 0-indexed
-    
-    # Convert column letter to index
-    col_num = 0
-    for i, char in enumerate(reversed(col_letter)):
-        col_num += (ord(char) - ord('A') + 1) * (26 ** i)
-    col_num -= 1  # 0-indexed
-    
-    # Python code to write the cell
-    python_code = f"""
-from odf.opendocument import load
-from odf import table
-from odf.table import TableRow, TableCell
-from odf.text import P
-
-# Load or create spreadsheet
-try:
-    doc = load('/workspace/{filename}')
-except FileNotFoundError:
-    from odf.opendocument import OpenDocumentSpreadsheet
-    from odf.table import Table
-    doc = OpenDocumentSpreadsheet()
-    # Create the sheet if it doesn't exist
-    new_table = Table(name='{sheet}')
-    doc.spreadsheet.addElement(new_table)
-
-# Find the sheet
-tables = doc.spreadsheet.getElementsByType(table.Table)
-target_table = None
-for tbl in tables:
-    if tbl.getAttribute('name') == '{sheet}':
-        target_table = tbl
-        break
-
-if target_table is None:
-    print('ERROR: Sheet not found')
-    exit(1)
-
-# Get or create rows up to target row
-rows = target_table.getElementsByType(table.TableRow)
-while len(rows) <= {row_num}:
-    target_table.addElement(TableRow())
-    rows = target_table.getElementsByType(table.TableRow)
-
-# Get or create cells up to target column
-target_row = rows[{row_num}]
-cells = target_row.getElementsByType(table.TableCell)
-while len(cells) <= {col_num}:
-    target_row.addElement(TableCell())
-    cells = target_row.getElementsByType(table.TableCell)
-
-# Write to the cell
-target_cell = cells[{col_num}]
-
-# Clear existing content
-for child in list(target_cell.childNodes):
-    target_cell.removeChild(child)
-
-# Add new content
-target_cell.addElement(P(text='{value}'))
-
-# Save
-doc.save('/workspace/{filename}')
-print('Success')
-"""
-    
-    result = execute_python_in_sandbox(python_code)
-    
-    if result['exit_code'] != 0:
-        error_msg = result['error'] or result['output']
-        raise RuntimeError(f"Failed to write cell: {error_msg}")
-    
-    return f"Successfully wrote '{value}' to {sheet}!{cell}"
-
-
-@mcp.tool()
-def write_formula(filename: str, sheet: str, cell: str, formula: str) -> str:
-    """Write formula to a cell (e.g., "=SUM(A1:A10)")."""
-    # Convert A1 notation to row/col indices
-    col_letter = ''.join(c for c in cell if c.isalpha()).upper()
-    row_num = int(''.join(c for c in cell if c.isdigit())) - 1  # 0-indexed
-    
-    # Convert column letter to index
-    col_num = 0
-    for i, char in enumerate(reversed(col_letter)):
-        col_num += (ord(char) - ord('A') + 1) * (26 ** i)
-    col_num -= 1  # 0-indexed
-    
-    # Escape formula for Python string
-    formula_escaped = formula.replace("'", "\\'")
-    
-    # Python code to write formula
-    python_code = f"""
-from odf.opendocument import load
-from odf import table
-from odf.table import TableRow, TableCell
-from odf.text import P
-
-# Load spreadsheet
-doc = load('/workspace/{filename}')
-
-# Find the sheet
-tables = doc.spreadsheet.getElementsByType(table.Table)
-target_table = None
-for tbl in tables:
-    if tbl.getAttribute('name') == '{sheet}':
-        target_table = tbl
-        break
-
-if target_table is None:
-    print('ERROR: Sheet not found')
-    exit(1)
-
-# Get or create rows up to target row
-rows = target_table.getElementsByType(table.TableRow)
-while len(rows) <= {row_num}:
-    target_table.addElement(TableRow())
-    rows = target_table.getElementsByType(table.TableRow)
-
-# Get or create cells up to target column
-target_row = rows[{row_num}]
-cells = target_row.getElementsByType(table.TableCell)
-while len(cells) <= {col_num}:
-    target_row.addElement(TableCell())
-    cells = target_row.getElementsByType(table.TableCell)
-
-# Write formula to the cell
-target_cell = cells[{col_num}]
-
-# Set formula attribute
-target_cell.setAttribute('formula', '{formula_escaped}')
-
-# Save
-doc.save('/workspace/{filename}')
-print('Success')
-"""
-    
-    result = execute_python_in_sandbox(python_code)
-    
-    if result['exit_code'] != 0:
-        error_msg = result['error'] or result['output']
-        raise RuntimeError(f"Failed to write formula: {error_msg}")
-    
-    return f"Successfully wrote formula '{formula}' to {sheet}!{cell}"
 
 
 @mcp.tool()
@@ -377,37 +349,16 @@ def get_task_description() -> dict[str, Any]:
     
     Returns:
         Task definition including description, time limit, etc.
-    
-    Example:
-        get_task_description() -> {
-            "task_id": "banking_001",
-            "title": "Calculate Banking Reserves",
-            "description": "Using the provided spreadsheet, calculate reserves...",
-            "time_limit_seconds": 600
-        }
     """
-    global task_manager, current_task_id
+    ctx = get_context()
     
-    if current_task_id is None:
-        return {
-            "error": "No task loaded",
-            "message": "This is a development environment. In RL mode, tasks are loaded automatically."
-        }
-    
-    if task_manager is None:
-        task_manager = TaskManager()
-    
-    try:
-        task_def = task_manager.load_task(current_task_id)
-        return {
-            "task_id": task_def.get("task_id"),
-            "title": task_def.get("title"),
-            "description": task_def.get("description"),
-            "time_limit_seconds": task_def.get("time_limit_seconds"),
-            "starting_files": list(task_def.get("starting_files", {}).keys())
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    return {
+        "task_id": ctx.task_id,
+        "title": ctx.task_definition.get("title"),
+        "description": ctx.task_definition.get("description"),
+        "time_limit_seconds": ctx.task_definition.get("time_limit_seconds"),
+        "starting_files": ctx.task_definition.get("initial_files", [])
+    }
 
 
 @mcp.tool()
@@ -416,55 +367,17 @@ def submit_task(output_files: list[str] | None = None) -> dict[str, Any]:
     Submit task outputs for grading.
     
     Args:
-        output_files: List of filenames in /workspace to grade (e.g., ["sales.ods"])
-                     If None, grades all files in workspace
+        output_files: List of filenames in /workspace to grade (optional)
     
     Returns:
         Grading results with score and feedback
-    
-    Example:
-        submit_task(["sales.ods"]) -> {
-            "passed": True,
-            "score": 1.0,
-            "feedback": "Perfect! All cells correct."
-        }
     """
-    global sandbox_manager, task_manager, current_task_id, current_run_dir
-    
-    if current_task_id is None:
-        return {
-            "error": "No task loaded",
-            "message": "Use start_episode.py to start a task episode"
-        }
-    
-    if sandbox_manager is None or not sandbox_manager.is_running():
-        return {"error": "No sandbox running"}
-    
-    if task_manager is None:
-        task_manager = TaskManager()
+    ctx = get_context()
     
     try:
-        # If using run dir (episode mode), grade from there
-        if current_run_dir and current_run_dir.exists():
-            from evaluation.grader import grade_task_run
-            result = grade_task_run(current_task_id, current_run_dir)
-            return result
-        
-        # Otherwise extract from container (legacy mode)
-        if output_files is None:
-            output_files = list_workspace_files()
-        
-        # Convert to full paths
-        full_paths = [f"/workspace/{f}" if not f.startswith("/") else f 
-                     for f in output_files]
-        
-        extracted = sandbox_manager.extract_files_from_container(full_paths)
-        
-        # Grade (old method - not ideal but works)
-        return {
-            "error": "Cannot grade without run directory context",
-            "message": "Use start_episode.py for proper grading workflow"
-        }
+        from grader import grade_task_run
+        result = grade_task_run(ctx.task_id, ctx.run_dir)
+        return result
         
     except Exception as e:
         return {
@@ -477,6 +390,8 @@ def submit_task(output_files: list[str] | None = None) -> dict[str, Any]:
 @mcp.tool()
 def execute_sql(database: str, query: str) -> dict[str, Any]:
     """Execute SQL query on SQLite database (SELECT only)."""
+    ctx = get_context()
+    
     # Safety: Only allow SELECT queries
     if not query.strip().upper().startswith("SELECT"):
         raise ValueError("Only SELECT queries are allowed")
@@ -503,7 +418,7 @@ finally:
     conn.close()
 """
     
-    result = execute_python_in_sandbox(python_code)
+    result = ctx.sandbox_manager.execute_command(["python", "-c", python_code])
     
     if result['exit_code'] != 0:
         error_msg = result['error'] or result['output']
@@ -523,10 +438,9 @@ def list_database_tables(database: str) -> list[str]:
     
     Returns:
         List of table names
-    
-    Example:
-        list_database_tables("sales.db") -> ["products", "customers", "orders"]
     """
+    ctx = get_context()
+    
     python_code = f"""
 import sqlite3
 import json
@@ -542,7 +456,7 @@ finally:
     conn.close()
 """
     
-    result = execute_python_in_sandbox(python_code)
+    result = ctx.sandbox_manager.execute_command(["python", "-c", python_code])
     
     if result['exit_code'] != 0:
         error_msg = result['error'] or result['output']
@@ -563,10 +477,9 @@ def create_new_spreadsheet(filename: str, sheet_name: str = "Sheet1") -> str:
     
     Returns:
         Success message
-    
-    Example:
-        create_new_spreadsheet("report.ods", "Summary") -> "Created report.ods"
     """
+    ctx = get_context()
+    
     python_code = f"""
 from odf.opendocument import OpenDocumentSpreadsheet
 from odf.table import Table
@@ -578,7 +491,7 @@ doc.save('/workspace/{filename}')
 print('Success')
 """
     
-    result = execute_python_in_sandbox(python_code)
+    result = ctx.sandbox_manager.execute_command(["python", "-c", python_code])
     
     if result['exit_code'] != 0:
         error_msg = result['error'] or result['output']
@@ -587,29 +500,28 @@ print('Success')
     return f"Created {filename} with sheet '{sheet_name}'"
 
 
+# ============================================================================
+# Computer Use Mode Tools (GUI interaction)
+# ============================================================================
+
 @mcp.tool()
 def take_screenshot() -> str:
     """Capture screenshot, returns base64 PNG."""
-    global sandbox_manager
-    
-    if sandbox_manager is None or not sandbox_manager.is_running():
-        return "Error: No sandbox running"
+    ctx = get_context()
     
     python_code = """
 import subprocess
 import base64
 
-# Take screenshot using scrot
 subprocess.run(['scrot', '/tmp/screenshot.png'], env={'DISPLAY': ':99'})
 
-# Read and encode
 with open('/tmp/screenshot.png', 'rb') as f:
     img_data = f.read()
     b64 = base64.b64encode(img_data).decode('utf-8')
     print(b64)
 """
     
-    result = execute_python_in_sandbox(python_code)
+    result = ctx.sandbox_manager.execute_command(["python", "-c", python_code])
     
     if result['exit_code'] != 0:
         error_msg = result['error'] or result['output']
@@ -621,12 +533,9 @@ with open('/tmp/screenshot.png', 'rb') as f:
 @mcp.tool()
 def click(x: int, y: int) -> str:
     """Click mouse at coordinates."""
-    global sandbox_manager
+    ctx = get_context()
     
-    if sandbox_manager is None or not sandbox_manager.is_running():
-        return "Error: No sandbox running"
-    
-    result = sandbox_manager.execute_command([
+    result = ctx.sandbox_manager.execute_command([
         "sh", "-c",
         f"DISPLAY=:99 xdotool mousemove {x} {y} click 1"
     ])
@@ -640,13 +549,9 @@ def click(x: int, y: int) -> str:
 @mcp.tool()
 def double_click(x: int, y: int) -> str:
     """Double-click mouse at coordinates."""
-    global sandbox_manager
+    ctx = get_context()
     
-    if sandbox_manager is None or not sandbox_manager.is_running():
-        return "Error: No sandbox running"
-    
-    # Use xdotool to double-click
-    result = sandbox_manager.execute_command([
+    result = ctx.sandbox_manager.execute_command([
         "sh", "-c",
         f"DISPLAY=:99 xdotool mousemove {x} {y} click --repeat 2 --delay 100 1"
     ])
@@ -667,19 +572,13 @@ def type_text(text: str) -> str:
     
     Returns:
         Success message
-    
-    Example:
-        type_text("Hello World") -> "Typed: Hello World"
     """
-    global sandbox_manager
-    
-    if sandbox_manager is None or not sandbox_manager.is_running():
-        return "Error: No sandbox running"
+    ctx = get_context()
     
     # Escape text for shell
     escaped_text = text.replace("'", "'\\''")
     
-    result = sandbox_manager.execute_command([
+    result = ctx.sandbox_manager.execute_command([
         "sh", "-c",
         f"DISPLAY=:99 xdotool type '{escaped_text}'"
     ])
@@ -700,17 +599,10 @@ def press_key(key: str) -> str:
     
     Returns:
         Success message
-    
-    Example:
-        press_key("ctrl+s") -> "Pressed: ctrl+s"
-        press_key("Return") -> "Pressed: Return"
     """
-    global sandbox_manager
+    ctx = get_context()
     
-    if sandbox_manager is None or not sandbox_manager.is_running():
-        return "Error: No sandbox running"
-    
-    result = sandbox_manager.execute_command([
+    result = ctx.sandbox_manager.execute_command([
         "sh", "-c",
         f"DISPLAY=:99 xdotool key {key}"
     ])
@@ -730,20 +622,23 @@ def reset_environment() -> str:
     Returns:
         Status message
     """
-    global sandbox_manager
+    ctx = get_context()
     
-    if sandbox_manager is not None:
-        sandbox_manager.cleanup()
-        sandbox_manager = None
-        return "Environment reset successfully"
+    ctx.sandbox_manager.cleanup()
     
-    return "Environment was not running"
+    # Clear context
+    from utils import clear_context
+    clear_context()
+    
+    return "Environment reset successfully"
 
 
+#diff modes use diff toolsets
 def get_tool_use_tools() -> dict:
     """Get all tool-use mode MCP tools."""
     return {
         "read_cell": read_cell,
+        "read_range": read_range,
         "write_cell": write_cell,
         "write_formula": write_formula,
         "get_spreadsheet_info": get_spreadsheet_info,
@@ -751,6 +646,7 @@ def get_tool_use_tools() -> dict:
         "execute_sql": execute_sql,
         "list_database_tables": list_database_tables,
         "create_new_spreadsheet": create_new_spreadsheet,
+        "get_task_description": get_task_description,
         "submit_task": submit_task
     }
 
@@ -764,6 +660,7 @@ def get_computer_use_tools() -> dict:
         "type_text": type_text,
         "press_key": press_key,
         "list_workspace_files": list_workspace_files,
+        "get_task_description": get_task_description,
         "submit_task": submit_task
     }
 
