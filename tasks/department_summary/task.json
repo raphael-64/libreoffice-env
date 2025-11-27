@@ -1,0 +1,8 @@
+{
+  "task_id": "department_summary",
+  "title": "Department Salary Summary",
+  "description": "Complete the Summary sheet by calculating aggregate statistics for each department based on the employee data.",
+  "time_limit_seconds": 600,
+  "initial_files": ["employees.ods"],
+  "expected_outputs": ["employees.ods"]
+}

@@ -1,0 +1,8 @@
+{
+  "task_id": "sales_totals",
+  "title": "Calculate Sales Totals",
+  "description": "Calculate Total for each product using the formula: Total = Price × Quantity. The spreadsheet has Product, Price, Quantity, and Total columns. Write formulas to calculate Total for each product row.",
+  "time_limit_seconds": 300,
+  "initial_files": ["sales.ods"],
+  "expected_outputs": ["sales.ods"]
+}

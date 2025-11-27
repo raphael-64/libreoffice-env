@@ -1,0 +1,8 @@
+{
+  "task_id": "banking_reserves",
+  "title": "Calculate Banking Reserves",
+  "description": "Calculate reserves using the present value formula: Reserve = CashFlow / (1 + DiscountRate × Days/365). The spreadsheet has columns for Date, CashFlow, Days, DiscountRate, and Reserve. Write formulas to the Reserve column for all 100 data rows.",
+  "time_limit_seconds": 600,
+  "initial_files": ["cash_flows.ods"],
+  "expected_outputs": ["cash_flows.ods"]
+}

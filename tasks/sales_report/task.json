@@ -1,0 +1,8 @@
+{
+  "task_id": "sales_report",
+  "title": "Generate Sales Report from Database",
+  "description": "Query the sales.db database and create a sales_report.ods spreadsheet with a sheet named 'SalesReport'. The report should show: Product, Category, number of Transactions, TotalQuantity sold, and TotalRevenue. Sort by revenue (highest first).",
+  "time_limit_seconds": 600,
+  "initial_files": ["sales.db"],
+  "expected_outputs": ["sales_report.ods"]
+}
